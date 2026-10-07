@@ -22,6 +22,135 @@ import { applyElectronProxy, electronProxyUrlFor } from "./electron-proxy";
 
 const log = createLogger("electron-tool");
 
+/** 番剧 CDN 会按这个旧标识放行，不能改到播放窗口上。 */
+const PLAYBACK_USER_AGENT =
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) bilibili_pc/1.9.1 Chrome/98.0.4758.141 Electron/17.4.11 Safari/537.36";
+
+/**
+ * 登录页里的极验会对照 User-Agent 和真实 Chrome 版本。
+ * 标识写成 Chrome 98、引擎却是当前 Chromium 时，短信验证码一律返回失效。
+ */
+const loginUserAgent = () =>
+  `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Electron/${process.versions.electron} Safari/537.36`;
+
+const isLoginSurface = (url: string) =>
+  /login\.html|passport\.bilibili\.com|geetest\.com|recaptcha/i.test(url);
+
+const APP_TITLE = "哔哩哔哩干杯";
+const windowRole = new WeakMap<BrowserWindow, "main" | "player">();
+
+/** 去掉官方标题尾巴，只留视频名。反复调用不会把「哔哩哔哩干杯」叠上去。 */
+const videoNameFromTitle = (title: string) => {
+  let name = title.trim();
+  const suffixes = [
+    "哔哩哔哩 (゜-゜)つロ 干杯~-bilibili",
+    "_哔哩哔哩_bilibili",
+    "- 哔哩哔哩",
+    "_哔哩哔哩",
+    " - bilibili",
+    "_bilibili",
+    "-bilibili",
+    APP_TITLE,
+  ];
+  let changed = true;
+  while (name && changed) {
+    changed = false;
+    for (const suffix of suffixes) {
+      if (!name.endsWith(suffix)) continue;
+      name = name.slice(0, -suffix.length).replace(/[\s_\-|]+$/u, "");
+      changed = true;
+    }
+  }
+  return name.trim();
+};
+
+const LOGIN_COOKIE_NAMES = new Set([
+  "SESSDATA",
+  "bili_jct",
+  "DedeUserID",
+  "DedeUserID__ckMd5",
+  "sid",
+]);
+const watchedLoginSessions = new WeakSet<Electron.Session>();
+let appliedSessdata = "";
+let pendingSessdata = "";
+let adoptSession: Electron.Session | undefined;
+let adoptTimer: ReturnType<typeof setTimeout> | undefined;
+
+const cookieUrl = (cookie: Electron.Cookie) => {
+  const host = (cookie.domain || "bilibili.com").replace(/^\./, "");
+  return `https://${host}${cookie.path || "/"}`;
+};
+
+/** 登录弹窗常常单独开一个 session，主窗口读不到 SESSDATA，设置页就一直是「立即登录」。 */
+const copyLoginCookies = async (from: Electron.Session) => {
+  if (from === session.defaultSession) return;
+  const cookies = await from.cookies.get({});
+  for (const cookie of cookies) {
+    if (!cookie.domain?.includes("bilibili.com")) continue;
+    if (!LOGIN_COOKIE_NAMES.has(cookie.name)) continue;
+    await session.defaultSession.cookies.set({
+      url: cookieUrl(cookie),
+      name: cookie.name,
+      value: cookie.value,
+      domain: cookie.domain,
+      path: cookie.path || "/",
+      secure: cookie.secure,
+      httpOnly: cookie.httpOnly,
+      expirationDate: cookie.session ? undefined : cookie.expirationDate,
+      sameSite: cookie.sameSite === "unspecified" ? undefined : cookie.sameSite,
+    });
+  }
+};
+
+const reloadMainForLogin = () => {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.webContents.getURL().includes("index.html")) continue;
+    log.info("主窗口重新读取登录状态");
+    win.webContents.reload();
+  }
+};
+
+const finishAdoptLogin = async () => {
+  const source = adoptSession;
+  const sessdata = pendingSessdata;
+  if (!source || !sessdata || sessdata === appliedSessdata) return;
+  appliedSessdata = sessdata;
+  try {
+    await copyLoginCookies(source);
+    log.info("登录票已写入主会话");
+    reloadMainForLogin();
+  } catch (err) {
+    appliedSessdata = "";
+    log.error("同步登录 Cookie 失败", err);
+  }
+};
+
+const scheduleAdoptLogin = (ses: Electron.Session, sessdata: string) => {
+  if (!sessdata || sessdata === appliedSessdata) return;
+  adoptSession = ses;
+  pendingSessdata = sessdata;
+  clearTimeout(adoptTimer);
+  adoptTimer = setTimeout(() => {
+    void finishAdoptLogin();
+  }, 500);
+};
+
+const watchLoginSession = (ses: Electron.Session) => {
+  if (watchedLoginSessions.has(ses)) return;
+  watchedLoginSessions.add(ses);
+  ses.cookies.on("changed", (_event, cookie, _cause, removed) => {
+    if (removed || cookie.name !== "SESSDATA" || !cookie.value) return;
+    if (!cookie.domain?.includes("bilibili.com")) return;
+    scheduleAdoptLogin(ses, cookie.value);
+  });
+};
+
+export const installLoginCookieSync = () => {
+  app.on("session-created", watchLoginSession);
+  app.whenReady().then(() => watchLoginSession(session.defaultSession));
+};
+
 /**
  * require() 的模块替换表：键为 require 的模块名，值为「拿到原始模块后返回什么」。
  * 需要在官方主代码 require 某个模块之前登记，见 registerModuleLoadHook。
@@ -101,6 +230,7 @@ export const initializeGlobalData = () => {
 }
 
 export const replaceBrowserWindow = () => {
+  installLoginCookieSync();
   const originalBrowserWindow = BrowserWindow;
   const hookBrowserWindow = (OriginalBrowserWindow: typeof BrowserWindow) => {
     function HookedBrowserWindow(
@@ -120,6 +250,51 @@ export const replaceBrowserWindow = () => {
       }
       // 使用修改后的选项调用原始构造函数
       const instance: BrowserWindow = new OriginalBrowserWindow(options);
+      const originalSetTitle = instance.setTitle.bind(instance);
+      let writingTitle = false;
+      const writeTitle = (raw: string) => {
+        if (writingTitle) return;
+        const role = windowRole.get(instance);
+        if (!role) return;
+        const name = role === "player" ? videoNameFromTitle(raw) : "";
+        const next = role === "player" && name ? `${name}${APP_TITLE}` : APP_TITLE;
+        if (instance.getTitle() === next) return;
+        writingTitle = true;
+        originalSetTitle(next);
+        writingTitle = false;
+      };
+      instance.setTitle = (title: string) => {
+        if (!windowRole.has(instance)) {
+          originalSetTitle(title);
+          return;
+        }
+        writeTitle(title);
+      };
+      instance.on("page-title-updated", (event, title) => {
+        if (!windowRole.has(instance)) return;
+        event.preventDefault();
+        writeTitle(title);
+      });
+      instance.webContents.on(
+        "will-attach-webview",
+        (_event, prefs, params) => {
+          if (!isLoginSurface(params.src || "")) return;
+          // 和主窗口共用默认会话，扫码 / 短信拿到的登录票才能被设置页读到。
+          delete prefs.partition;
+          delete params.partition;
+          params.useragent = loginUserAgent();
+          log.info("login webview userAgent:", params.useragent);
+        }
+      );
+      instance.webContents.on("did-attach-webview", (_event, guest) => {
+        watchLoginSession(guest.session);
+        const apply = (url: string) => {
+          if (!isLoginSurface(url) && !isLoginSurface(guest.getURL())) return;
+          guest.setUserAgent(loginUserAgent());
+        };
+        guest.on("will-navigate", (_navEvent, url) => apply(url));
+        apply(guest.getURL());
+      });
       instance.webContents.on("ipc-message-sync", (event, ...args) => {
         if (args[0] === "config/roamingPAC") {
           log.info("receive config/roamingPAC: ", ...args);
@@ -273,12 +448,16 @@ export const electronOverwrite = () => {
       options?: Electron.LoadURLOptions
     ) {
       this.setMinimumSize(300, 300);
-      // 设置UA，有些番剧播放链接Windows会403
+      // 播放页继续用旧标识，避免番剧地址 403。登录页必须和当前 Chromium 一致。
       this.webContents.setUserAgent(
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) bilibili_pc/1.9.1 Chrome/98.0.4758.141 Electron/17.4.11 Safari/537.36"
+        isLoginSurface(url) ? loginUserAgent() : PLAYBACK_USER_AGENT
       );
       log.info("=====loadURL:", url);
-      return originloadURL.apply(this, [url, options]);
+      if (url.includes("player.html")) windowRole.set(this, "player");
+      else if (url.includes("index.html")) windowRole.set(this, "main");
+      const loaded = originloadURL.apply(this, [url, options]);
+      if (windowRole.has(this)) this.setTitle(this.getTitle());
+      return loaded;
     };
   }
   {
