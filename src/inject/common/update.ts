@@ -2,6 +2,7 @@ import { net, shell } from "electron";
 import EventEmitter from "events";
 import { createLogger } from "../../common/log";
 import { registerModuleLoadHook } from "./electron-tool";
+import { whenElectronProxyReady } from "./electron-proxy";
 
 /**
  * 「检查更新」的数据源。
@@ -69,25 +70,19 @@ interface VersionedRelease {
 }
 
 /**
- * 优先用 Electron 的 net（走系统代理，兼容 PAC / 漫游设置），
- * 拿不到时（例如 app 还没 ready）回退到 Node 的全局 fetch。
+ * 只用 Electron 的 net.fetch。它走 defaultSession 的代理（--proxy-server / 系统代理 / 漫游 PAC）。
+ * 失败时不再改走 Node fetch，那条链路不看 Electron 代理，超时会被当成「代理不可用」。
  */
 const doFetch = async (url: string): Promise<Response> => {
-  const headers = {
-    // GitHub API 强制要求 User-Agent
-    "user-agent": REPO,
-    accept: "application/vnd.github+json",
-  };
-  const init: RequestInit = {
-    headers,
+  await whenElectronProxyReady();
+  return net.fetch(url, {
+    headers: {
+      // GitHub API 强制要求 User-Agent
+      "user-agent": REPO,
+      accept: "application/vnd.github+json",
+    },
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  };
-  try {
-    return await net.fetch(url, init);
-  } catch (err) {
-    log.warn("net.fetch 不可用，回退到全局 fetch:", err);
-    return await fetch(url, init);
-  }
+  });
 };
 
 const requestJson = async <T>(url: string): Promise<T> => {

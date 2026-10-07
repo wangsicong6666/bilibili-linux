@@ -2,7 +2,8 @@ import { createLogger } from "../../common/log";
 import https from "https";
 import path from "path";
 import fs from "fs";
-import { app, session } from "electron";
+import { app } from "electron";
+import { installElectronProxy, installSessionFetch } from "./electron-proxy";
 
 const log = createLogger("Bilibili");
 export const createBilibiliServer = () => {
@@ -61,25 +62,9 @@ export const createBilibiliServer = () => {
       callback(false);
     }
   });
-  // Chromium 150 NetworkService honors the system proxy. bilipc.bilibili.com is
-  // host-rules-mapped to localhost:3031; routed through the proxy it cannot be
-  // resolved (NXDOMAIN) and the proxy closes the connection -> ERR_CONNECTION_CLOSED
-  // (-100) -> blank window. Force bilipc + loopback to bypass the proxy. This
-  // whenReady callback is registered before index.ts's whenReady (which triggers
-  // loadURL), so the bypass is in effect before the main window navigates.
-  app.whenReady().then(() => {
-    // Electron setProxy defaults to mode=FIXED_SERVERS; omitting proxyRules
-    // means empty proxy → direct (no proxy at all), which would bypass the
-    // system proxy for ALL requests. Read the proxy URL from the environment
-    // so external API requests still go through the system proxy while
-    // bilipc/localhost bypass it via proxyBypassRules.
-    const proxyUrl = (
-      process.env.HTTPS_PROXY || process.env.HTTP_PROXY ||
-      process.env.https_proxy || process.env.http_proxy || ""
-    ).trim();
-    session.defaultSession.setProxy({
-      proxyRules: proxyUrl.replace(/^https?:\/\//i, "").replace(/\/+$/, "") || undefined,
-      proxyBypassRules: "bilipc.bilibili.com,localhost,127.0.0.1",
-    }).catch(() => {});
-  });
+  // Chromium 150 会把 bilipc.bilibili.com（映射到 localhost:3031）也送进代理，
+  // 代理解析失败后连接被关掉，主窗口白屏。这里按 --proxy-server 重新 setProxy，
+  // 并让本机地址绕过。必须在窗口 loadURL 之前完成，见 index.ts。
+  installSessionFetch();
+  installElectronProxy();
 };

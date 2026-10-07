@@ -18,6 +18,7 @@ import { DynamicClient } from "./dynamic.client";
 import { GrpcTransport } from "@protobuf-ts/grpc-transport";
 import type { RpcMetadata } from "@protobuf-ts/runtime-rpc";
 import { Device, DynDetailReply, Metadata } from "./dynamic";
+import { applyElectronProxy, electronProxyUrlFor } from "./electron-proxy";
 
 const log = createLogger("electron-tool");
 
@@ -134,7 +135,7 @@ export const replaceBrowserWindow = () => {
                 ses.resolveProxy("akamai.net").then((res) => {
                   log.info("resolveProxy akamai.net --> ", res);
                   event.returnValue = res.length === 0 ? "error" : "ok";
-                  if (res.length === 0) ses.setProxy({ mode: "system" });
+                  if (res.length === 0) void applyElectronProxy(ses);
                 });
               });
             })
@@ -467,57 +468,66 @@ export const registerIpcHandle = () => {
     });
     return tempfile;
   });
-  ipcMain.handle(
-    "sponsor/transcribeAudio",
-    (_, options) =>
-      new Promise((resolve, reject) => {
-        // 2. 语音转文字
-        log.info("sponsor/transcribeAudio:", options);
-        const file = options.file;
-        const proxy = options.proxy;
-        const libPath = options.libPath;
-        const task = spawn(
-          path.resolve(__dirname, "../transcribe.py"),
-          [file],
-          {
-            env: {
-              HTTPS_PROXY: proxy,
-              HTTP_PROXY: proxy,
-              LD_LIBRARY_PATH: `${process.env.LD_LIBRARY_PATH}:${libPath}`,
-            },
-          }
-        );
-        let stdout = "";
-        let stderr = "";
+  ipcMain.handle("sponsor/transcribeAudio", async (_, options) => {
+    // Python 不走 Chromium，把 Electron 解析出的代理地址传给它。
+    log.info("sponsor/transcribeAudio:", options);
+    const file = options.file;
+    const proxy =
+      (typeof options.proxy === "string" && options.proxy.trim()) ||
+      (await electronProxyUrlFor("https://huggingface.co"));
+    const libPath = options.libPath;
+    const task = spawn(
+      path.resolve(__dirname, "../transcribe.py"),
+      [file],
+      {
+        env: {
+          HTTPS_PROXY: proxy,
+          HTTP_PROXY: proxy,
+          LD_LIBRARY_PATH: `${process.env.LD_LIBRARY_PATH}:${libPath}`,
+        },
+      }
+    );
+    let stdout = "";
+    let stderr = "";
 
-        task.stdout.on("data", (msg) => {
-          // console.info('stdout:', msg.toString())
-          stdout += msg.toString();
-        });
-        task.stderr.on("data", (msg) => {
-          // console.info('stderr:', msg.toString())
-          stderr += msg.toString();
-        });
-        task.on("close", (code) => {
-          log.info("close:", code, task.exitCode);
-          if (stderr) {
-            reject(stderr);
-          } else {
-            resolve(stdout);
-          }
-        });
-      })
-  );
+    task.stdout.on("data", (msg) => {
+      stdout += msg.toString();
+    });
+    task.stderr.on("data", (msg) => {
+      stderr += msg.toString();
+    });
+    return await new Promise((resolve, reject) => {
+      task.on("close", (code) => {
+        log.info("close:", code, task.exitCode);
+        if (stderr) {
+          reject(stderr);
+        } else {
+          resolve(stdout);
+        }
+      });
+    });
+  });
 
   ipcMain.handle(
     "roaming/queryDynamicDetail",
     async (_, dynamicId, accessKey) => {
       log.info("dynamic id:", dynamicId, accessKey);
 
+      // @grpc/grpc-js 只用自己的 HTTP/2，并且只从 grpc_proxy / https_proxy 读代理。
+      // 地址来自 Electron 的 resolveProxy，不是用户导出的环境变量。
+      const grpcProxy = await electronProxyUrlFor("https://grpc.biliapi.net");
+      if (grpcProxy) {
+        process.env.grpc_proxy = grpcProxy;
+        process.env.https_proxy = grpcProxy;
+        process.env.http_proxy = grpcProxy;
+        process.env.NO_PROXY = "localhost,127.0.0.1,bilipc.bilibili.com";
+        process.env.no_proxy = process.env.NO_PROXY;
+      }
       const transport = new GrpcTransport({
         host: "grpc.biliapi.net",
         channelCredentials: ChannelCredentials.createSsl(),
         clientOptions: {
+          "grpc.enable_http_proxy": 1,
           "grpc.primary_user_agent": "Dalvik/2.1.0 (Linux; U; Android 10; RMX2117 Build/QP1A.190711.020) 7.61.0 os/android model/Pixel XL mobi_app/android build/7610300 channel/yingyongbao innerVer/7610310 osVer/10 network/2 grpc-java-cronet/1.36.1",
         }
       });
