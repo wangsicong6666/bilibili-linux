@@ -4,19 +4,24 @@
 name: Build Packages
 
 on:
+  # 在 Actions 页面可以手动点 Run workflow
+  workflow_dispatch:
   release:
     types: [published]
+  # 推送到这些分支会自动构建。fork 后默认分支经常是 main，只写 master 时推送不会触发。
   push:
-    tags:        
+    branches: [ main, master, dev, ci ]
+    tags:
       - v*
-    branches: [ master, dev, ci]
     paths-ignore:
       - 'README.md'
+      - 'README.MD'
+      - 'README_en.MD'
+      - 'README_zh-tw.MD'
       - 'CHANGELOG.md'
+      - 'CHANGELOG.MD'
   pull_request:
-    branches: [ master ]
-  # # Allows you to run this workflow manually from the Actions tab
-  # workflow_dispatch:
+    branches: [ main, master ]
 
 permissions:
   contents: write
@@ -33,7 +38,7 @@ jobs:
         # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: 'recursive'
       - name: Use Node.js
@@ -114,7 +119,7 @@ jobs:
         ARCH: ['x64', 'arm64', 'loong64', 'loongarch64']
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: 'recursive'
       - name: Download artifacts
@@ -123,7 +128,7 @@ jobs:
           name: bilibili-app.src
           path: tmp/src
       - name: Use Node.js
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v4
 
       - name: Prepare
         env:
@@ -188,7 +193,7 @@ jobs:
         ARCH: ['x64', 'loong64']
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -258,7 +263,7 @@ jobs:
         ARCH: ['x64']
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -328,7 +333,7 @@ jobs:
         # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -411,11 +416,11 @@ jobs:
   #       # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
 
   #   steps:
-  #     - uses: actions/checkout@v2
+  #     - uses: actions/checkout@v4
   #       with:
   #         submodules: 'recursive'
   #     - name: Use Node.js ${{ matrix.node-version }}
-  #       uses: actions/setup-node@v2
+  #       uses: actions/setup-node@v4
   #       with:
   #         node-version: ${{ matrix.node-version }}
   #         cache: 'npm'
@@ -488,7 +493,7 @@ jobs:
   #       # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
 
   #   steps:
-  #     - uses: actions/checkout@v2
+  #     - uses: actions/checkout@v4
   #       with:
   #         submodules: 'recursive'
   #     - name: Install Snapcraft
